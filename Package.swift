@@ -14,13 +14,23 @@ let package = Package(
             targets: ["MetalCompute"]
         ),
     ],
+    dependencies: [
+        // Complex<Double> support (same package as used by Metal64)
+        .package(url: "https://github.com/apple/swift-numerics.git", from: "1.0.0")
+    ],
     targets: [
         .target(
-            name: "MetalCompute"
+            name: "MetalCompute",
+            dependencies: [
+                .product(name: "ComplexModule", package: "swift-numerics")
+            ]
         ),
         .testTarget(
             name: "MetalComputeTests",
-            dependencies: ["MetalCompute"]
+            dependencies: [
+                "MetalCompute",
+                .product(name: "ComplexModule", package: "swift-numerics")
+            ]
         ),
     ]
 )

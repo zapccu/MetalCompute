@@ -99,9 +99,12 @@ All types conforming to `MetalArgument` can be passed:
 | `Float16` (Apple silicon only) | `half` | value |
 | `SIMD2<Float>`, `SIMD3<Float>`, `SIMD4<Float>` | `float2`, `float3`, `float4` | value |
 | `SIMD2<Int32>`, `SIMD4<UInt32>`, … | `int2`, `uint4`, … | value |
+| `Double` | `float2` (Metal64 `f64`) | value, converted to (hi, lo) |
+| `Complex<Double>` | `float4` (Metal64 `c64`) | value, converted to (re.hi, re.lo, im.hi, im.lo) |
+| `Complex<Float>` | `float2` | value |
 | Own struct with `extension MyStruct: MetalArgument {}` | `struct` with same layout | value |
-| `[T]` | `device const T *` | copied into a buffer |
-| `UnsafeBufferPointer<T>`, `UnsafeMutableBufferPointer<T>` | `device const T *` | copied into a buffer |
+| `[T]` | `device const T *` | copied into a buffer (`Double` / `Complex<Double>` converted) |
+| `UnsafeBufferPointer<T>`, `UnsafeMutableBufferPointer<T>` | `device const T *` | copied into a buffer (`Double` / `Complex<Double>` converted) |
 | `MetalBuffer<T>` | `device T *` | buffer, no copy |
 
 Values up to 4 KB are passed with `setBytes`, larger values in a buffer.
@@ -130,18 +133,69 @@ struct ComputeParameters {
 
 The layout of the Swift struct must match the Metal struct. Pitfalls:
 
-- **`Int` and `Double` are not supported.** Swift `Int` has 64 bit, Metal `int` 32 bit, and Metal
-  has no `double`. Use `Int32` / `UInt32` and `Float`. Both types deliberately don't conform to
-  `MetalArgument`, so passing them is a compile error. Arrays and buffers of `Int`, `UInt` or `Double`
-  are stopped at runtime with a precondition failure. For Metal `long` use `Int64`.
+- **`Int` is not supported.** Swift `Int` has 64 bit, Metal `int` 32 bit. Use `Int32` / `UInt32`,
+  or `Int64` for Metal `long`. `Int` deliberately doesn't conform to `MetalArgument`, so passing it
+  is a compile error. Arrays and buffers of `Int` or `UInt` are stopped at runtime.
+- **No `Double` fields in structs.** Only `Double` arguments are converted, not `Double` fields
+  inside a struct. Use `SIMD2<Float>` (Metal64 `Float2`) fields and convert with `Float2(value)`.
 - **`SIMD3<Float>` / `float3` take 16 bytes**, not 12, in Swift and in Metal. Use them on both
   sides or use `packed_float3` in Metal together with three `Float` fields in Swift.
 - Keep the fields in the same order on both sides. Swift doesn't reorder struct fields, so with the same order and types the alignment padding matches.
 
 ### Literals
 
-Numeric literals are `Double` by default, so write `Float(1.5)` or `Int32(10)` when passing
-literal values directly.
+Numeric literals are `Double` by default. A literal `1.5` is therefore passed as `float2` (f64),
+not as `float`. Write `Float(1.5)` or `Int32(10)` when the kernel expects `float` or `int`.
+
+## Double and Complex&lt;Double&gt;
+
+Metal doesn't support `double`. MetalCompute converts `Double` and `Complex<Double>` arguments
+to the 64 bit emulation format of [Metal64](https://github.com/zapccu/Metal64):
+
+| Swift | Metal | Metal64 type | Layout |
+|-------|-------|--------------|--------|
+| `Double` | `float2` | `f64` | (hi, lo) |
+| `Complex<Double>` | `float4` | `c64` | (re.hi, re.lo, im.hi, im.lo) |
+
+`hi` is the value rounded to `Float`, `lo` the rounded rest. `hi + lo` has about 48 bit
+(14 decimal digits) precision. Infinity and values beyond the `Float` range get `lo = 0`.
+
+This works for single values, arrays and buffer pointers:
+
+```swift
+let center = Complex<Double>(-0.743643887037151, 0.131825904205330)
+let points: [Complex<Double>] = ...
+
+let result: [SIMD2<Float>] = try await kernel.run(points, center, Double(zoom), count: points.count)
+```
+
+```metal
+#include "c64.h"
+
+kernel void calculate(device const float4 *points [[buffer(0)]],
+                      constant float4     &center [[buffer(1)]],
+                      constant float2     &zoom   [[buffer(2)]],
+                      device float2       *result [[buffer(3)]],
+                      uint index [[thread_position_in_grid]])
+{
+    c64 c = c64(points[index]) * f64(zoom) + c64(center);
+    ...
+    result[index] = value.v;      // f64 result
+}
+```
+
+Results are not converted back automatically: use `SIMD2<Float>` / `SIMD4<Float>` (Metal64
+`Float2` / `Complex2`) as output type and convert with Metal64:
+
+```swift
+let doubles = result.map { Double($0) }                 // Float2 -> Double
+let complexes = result.map { ComplexDouble($0) }        // Complex2 -> Complex<Double>
+```
+
+`MetalBuffer<Double>` and output type `Double` are not allowed (stopped at runtime), because their
+memory would be passed 1:1. Use `MetalBuffer<SIMD2<Float>>` instead.
+
+The swift-numerics dependency of MetalCompute only provides the `Complex` type, Metal64 isn't required.
 
 ## Reusing buffers
 
