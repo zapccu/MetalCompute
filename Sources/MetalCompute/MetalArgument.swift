@@ -17,16 +17,20 @@ import Metal
 /// - SIMD vectors: `SIMD2`, `SIMD3`, `SIMD4`, `SIMD8`, `SIMD16` (e.g. `SIMD2<Float>` = Metal `float2`)
 /// - `Double` and `Complex<Double>`: converted to the 64 bit emulation format of Metal64,
 ///   `float2` (hi, lo) and `float4` (re.hi, re.lo, im.hi, im.lo). `Complex<Float>` = Metal `float2`.
+/// - Types conforming to `MetalEncodable`: converted with `toMetal()`
 /// - Arrays and buffer pointers of these types: `[T]`, `UnsafeBufferPointer<T>`, `UnsafeMutableBufferPointer<T>`
 /// - Persistent buffers: `MetalBuffer<T>`
 ///
-/// Own structs conform by an empty extension, as long as they only contain plain values
-/// (no classes, strings, arrays):
+/// Own structs with Metal layout conform by an empty extension, as long as they only contain
+/// plain values (no classes, strings, arrays):
 ///
 /// ```swift
 /// struct Parameters { var maxIterations: UInt32; var bailout: Float }
 /// extension Parameters: MetalArgument {}
 /// ```
+///
+/// Structs with a different Swift layout (e.g. `Int` or `Double` fields) conform to
+/// `MetalEncodable` instead and convert themselves with `toMetal()`.
 ///
 /// Single values are passed with `setBytes` (Metal `constant T&` or `constant T*`),
 /// arrays and buffer pointers are copied into a Metal buffer (Metal `device const T*`).
@@ -37,23 +41,28 @@ public protocol MetalArgument {
     /// Binds the argument to the compute encoder at the given buffer index.
     /// The default implementation passes the bytes of the value.
     func bind(to encoder: any MTLComputeCommandEncoder, index: Int, device: any MTLDevice) throws
+
+    /// Size in bytes of one element as it arrives in Metal: the value itself, or one element of
+    /// an array / buffer. Used to check the argument against the kernel signature.
+    /// The default is the stride of the type.
+    var metalStride: Int { get }
 }
 
 /// Values up to this size are passed with setBytes, larger values in a buffer (Metal limit)
 let maxInlineBytes = 4096
 
 /// Precondition: the type must be a plain value type without references, which is copied 1:1.
-/// Int and UInt are rejected, they don't match Metal int / uint.
-/// Double and Complex<Double> are rejected here: they can't be copied 1:1, because Metal doesn't
-/// support double. Arrays and buffer pointers of them are converted (see MetalArgument+F64.swift),
-/// buffers and output types must use SIMD2<Float> / SIMD4<Float> (Float2 / Complex2 of Metal64).
+/// Rejected are:
+/// - Int and UInt, they don't match Metal int / uint
+/// - Types conforming to MetalEncodable / MetalDecodable (e.g. Double, Complex<Double>):
+///   they must be converted, so they can't be copied 1:1 into a MetalBuffer or used as raw layout
 @inline(__always)
 func requirePlainType<T>(_ type: T.Type) {
     precondition(_isPOD(type), "\(type) contains references (class, String, Array, ...) and cannot be passed to Metal")
     precondition(type != Int.self && type != UInt.self,
                  "Swift \(type) has 64 bit, use Int32 / UInt32 (Metal int / uint) or Int64 / UInt64 (Metal long / ulong)")
-    precondition(!isF64Type(type),
-                 "Metal doesn't support double, use SIMD2<Float> / SIMD4<Float> (Float2 / Complex2 of Metal64) for \(type) buffers and results")
+    precondition(!(type is any MetalEncodable.Type) && !(type is any MetalDecodable.Type),
+                 "\(type) is converted with toMetal() / init(fromMetal:) and can't be copied 1:1, use its MetalLayout type")
 }
 
 /// Creates a shared Metal buffer containing a copy of the given bytes
@@ -65,25 +74,35 @@ func makeBuffer(_ bytes: UnsafeRawBufferPointer, device: any MTLDevice) throws -
     return buffer
 }
 
+/// Passes a plain value with setBytes (or in a buffer if larger than 4 KB).
+/// The value is padded to its stride, so the size matches the Metal struct layout.
+func bindValue<T>(_ value: T, to encoder: any MTLComputeCommandEncoder, index: Int, device: any MTLDevice) throws {
+    requirePlainType(T.self)
+
+    var bytes = [UInt8](repeating: 0, count: MemoryLayout<T>.stride)
+    withUnsafeBytes(of: value) { source in
+        bytes.withUnsafeMutableBytes { $0.copyMemory(from: source) }
+    }
+
+    if bytes.count <= maxInlineBytes {
+        bytes.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: index) }
+    }
+    else {
+        let buffer = try bytes.withUnsafeBytes { try makeBuffer($0, device: device) }
+        encoder.setBuffer(buffer, offset: 0, index: index)
+    }
+}
+
 extension MetalArgument {
 
-    /// Passes the value with setBytes (or in a buffer if larger than 4 KB).
-    /// The value is padded to its stride, so the size matches the Metal struct layout.
+    /// Passes the bytes of the value
     public func bind(to encoder: any MTLComputeCommandEncoder, index: Int, device: any MTLDevice) throws {
-        requirePlainType(Self.self)
+        try bindValue(self, to: encoder, index: index, device: device)
+    }
 
-        var bytes = [UInt8](repeating: 0, count: MemoryLayout<Self>.stride)
-        withUnsafeBytes(of: self) { source in
-            bytes.withUnsafeMutableBytes { $0.copyMemory(from: source) }
-        }
-
-        if bytes.count <= maxInlineBytes {
-            bytes.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: index) }
-        }
-        else {
-            let buffer = try bytes.withUnsafeBytes { try makeBuffer($0, device: device) }
-            encoder.setBuffer(buffer, offset: 0, index: index)
-        }
+    /// Stride of the type
+    public var metalStride: Int {
+        MemoryLayout<Self>.stride
     }
 }
 
@@ -110,15 +129,25 @@ extension SIMD16: MetalArgument {}
 
 // MARK: - Arrays and buffer pointers
 
+/// Size of one element in Metal: the MetalLayout stride for MetalEncodable types, otherwise the stride
+func elementMetalStride<E>(_ type: E.Type) -> Int {
+    if let encodable = type as? any MetalEncodable.Type {
+        return encodable.metalLayoutStride
+    }
+    return MemoryLayout<E>.stride
+}
+
 /// Copies the elements into a Metal buffer and binds it.
-/// Double and Complex<Double> elements are converted to the f64 / c64 format.
+/// MetalEncodable elements (e.g. Double, Complex<Double>) are converted with toMetal().
 func bindElements<E>(_ elements: UnsafeBufferPointer<E>, to encoder: any MTLComputeCommandEncoder,
                      index: Int, device: any MTLDevice) throws {
-    guard !elements.isEmpty else { throw MetalComputeError.emptyArgument(index: index) }
+    guard let base = elements.baseAddress, !elements.isEmpty else {
+        throw MetalComputeError.emptyArgument(index: index)
+    }
 
     let buffer: any MTLBuffer
-    if let converted = convertF64Elements(elements) {
-        buffer = try converted.withUnsafeBytes { try makeBuffer($0, device: device) }
+    if let encodable = E.self as? any MetalEncodable.Type {
+        buffer = try encodable.makeMetalBuffer(from: UnsafeRawPointer(base), count: elements.count, device: device)
     }
     else {
         requirePlainType(E.self)
@@ -133,6 +162,11 @@ extension Array: MetalArgument {
     public func bind(to encoder: any MTLComputeCommandEncoder, index: Int, device: any MTLDevice) throws {
         try withUnsafeBufferPointer { try bindElements($0, to: encoder, index: index, device: device) }
     }
+
+    /// Metal size of one element
+    public var metalStride: Int {
+        elementMetalStride(Element.self)
+    }
 }
 
 extension UnsafeBufferPointer: MetalArgument {
@@ -141,6 +175,11 @@ extension UnsafeBufferPointer: MetalArgument {
     public func bind(to encoder: any MTLComputeCommandEncoder, index: Int, device: any MTLDevice) throws {
         try bindElements(self, to: encoder, index: index, device: device)
     }
+
+    /// Metal size of one element
+    public var metalStride: Int {
+        elementMetalStride(Element.self)
+    }
 }
 
 extension UnsafeMutableBufferPointer: MetalArgument {
@@ -148,5 +187,10 @@ extension UnsafeMutableBufferPointer: MetalArgument {
     /// Copies the memory into a Metal buffer
     public func bind(to encoder: any MTLComputeCommandEncoder, index: Int, device: any MTLDevice) throws {
         try UnsafeBufferPointer(self).bind(to: encoder, index: index, device: device)
+    }
+
+    /// Metal size of one element
+    public var metalStride: Int {
+        elementMetalStride(Element.self)
     }
 }

@@ -33,6 +33,65 @@ struct EscapeResult: Equatable {
     var escaped: Bool
 }
 
+// Swift type with Double / Int fields and its Metal layout
+struct TransformMtl: Equatable {
+    var scale: SIMD2<Float>
+    var offset: SIMD2<Float>
+    var steps: Int32
+}
+
+struct Transform: MetalConvertible, Equatable {
+    var scale: Double
+    var offset: Double
+    var steps: Int
+
+    func toMetal() -> TransformMtl {
+        TransformMtl(scale: scale.toMetal(), offset: offset.toMetal(), steps: Int32(steps))
+    }
+
+    init(scale: Double, offset: Double, steps: Int) {
+        self.scale = scale
+        self.offset = offset
+        self.steps = steps
+    }
+
+    init(fromMetal value: TransformMtl) {
+        scale = Double(fromMetal: value.scale)
+        offset = Double(fromMetal: value.offset)
+        steps = Int(value.steps)
+    }
+}
+
+// Decoded Mandelbrot result
+struct Escape: MetalDecodable, Equatable {
+    var iterations: Int
+    var escaped: Bool
+
+    init(iterations: Int, escaped: Bool) {
+        self.iterations = iterations
+        self.escaped = escaped
+    }
+
+    init(fromMetal value: EscapeResult) {
+        iterations = Int(value.iterations)
+        escaped = value.escaped
+    }
+}
+
+// Decodable only, for initialValue checks
+struct Counter: MetalDecodable, Equatable {
+    var value: Int
+    init(fromMetal value: UInt32) { self.value = Int(value) }
+}
+
+// Convertible counter with initial value
+struct ConvertibleCounter: MetalConvertible, Equatable {
+    var value: Int
+    init(_ value: Int) { self.value = value }
+    init(fromMetal value: UInt32) { self.value = Int(value) }
+    func toMetal() -> UInt32 { UInt32(value) }
+}
+
 let kernelSource = """
 #include <metal_stdlib>
 using namespace metal;
@@ -78,12 +137,16 @@ kernel void grid_index(constant uint &width  [[buffer(0)]],
     result[position.y * width + position.x] = position.x * 1000 + position.y;
 }
 
-kernel void sum_large(constant float *large [[buffer(0)]],
-                      device float *result  [[buffer(1)]],
+struct LargeValue {
+    float values[1280];
+};
+
+kernel void sum_large(constant LargeValue &large [[buffer(0)]],
+                      device float *result       [[buffer(1)]],
                       uint index [[thread_position_in_grid]])
 {
     float sum = 0.0;
-    for (int i = 0; i < 1280; i++) sum += large[i];
+    for (int i = 0; i < 1280; i++) sum += large.values[i];
     result[index] = sum;
 }
 
@@ -112,6 +175,31 @@ kernel void copy_float4_value(constant float4 &value  [[buffer(0)]],
 kernel void copy_float4_array(device const float4 *values [[buffer(0)]],
                               device float4       *result [[buffer(1)]],
                               uint index [[thread_position_in_grid]])
+{
+    result[index] = values[index];
+}
+
+// Kernels for MetalEncodable / MetalDecodable
+struct TransformMtl {
+    float2 scale;      // f64
+    float2 offset;     // f64
+    int    steps;
+};
+
+kernel void apply_transform(device const float2 *values  [[buffer(0)]],
+                            constant TransformMtl &t     [[buffer(1)]],
+                            device TransformMtl *result  [[buffer(2)]],
+                            uint index [[thread_position_in_grid]])
+{
+    // Copies the transform and adds the index to steps, values are only passed through
+    result[index].scale = t.scale;
+    result[index].offset = values[index];
+    result[index].steps = t.steps + int(index);
+}
+
+kernel void copy_transforms(device const TransformMtl *values [[buffer(0)]],
+                            device TransformMtl *result       [[buffer(1)]],
+                            uint index [[thread_position_in_grid]])
 {
     result[index] = values[index];
 }
@@ -300,5 +388,135 @@ struct MetalComputeTests {
         #expect(f64Split(1e300) == SIMD2<Float>(.infinity, 0))    // beyond Float range
         #expect(f64Split(.nan).x.isNaN)
         #expect(f64Split(1.0) == SIMD2<Float>(1, 0))
+    }
+
+    // MARK: - MetalEncodable / MetalDecodable
+
+    @Test func encodableValueAndDecodableResult() async throws {
+        let values: [Double] = [0.1, 0.2, 0.3]
+        let transform = Transform(scale: 1.0 / 3.0, offset: 0, steps: 10)
+        let result: [Transform] = try await metal.kernel("apply_transform").run(values, transform, count: 3)
+
+        for (index, item) in result.enumerated() {
+            // Values went through the f64 format (~48 bit), so compare with the round trip
+            #expect(item.scale == Double(fromMetal: transform.scale.toMetal()))
+            #expect(item.offset == Double(fromMetal: values[index].toMetal()))
+            #expect(abs(item.offset - values[index]) < 1e-15)
+            #expect(item.steps == 10 + index)
+        }
+    }
+
+    @Test func encodableArray() async throws {
+        let transforms = (0..<5).map { Transform(scale: Double($0) / 7, offset: -Double($0), steps: $0) }
+        let raw: [TransformMtl] = try await metal.kernel("copy_transforms").run(transforms, count: transforms.count)
+        #expect(raw == transforms.map { $0.toMetal() })
+
+        // Round trip: encoded array in, decoded array out
+        let decoded: [Transform] = try await metal.kernel("copy_transforms").run(transforms, count: transforms.count)
+        #expect(decoded == transforms.map { Transform(fromMetal: $0.toMetal()) })
+    }
+
+    @Test func decodableMandelbrot() async throws {
+        let points: [SIMD2<Float>] = [[0, 0], [1, 0], [2, 2]]
+        let params = Parameters(scale: 0, offset: 0, iterations: 100)
+        let result: [Escape] = try await metal.kernel("mandelbrot").run(points, params, count: points.count)
+        #expect(result == [
+            Escape(iterations: 100, escaped: false),
+            Escape(iterations: 2, escaped: true),
+            Escape(iterations: 0, escaped: true)
+        ])
+    }
+
+    @Test func doubleResult() async throws {
+        let values: [Double] = [.pi, -1e-20, 12345.6789]
+        let result = try await metal.kernel("copy_float2_array").run(values, count: values.count, returning: Double.self)
+        #expect(result == values.map { Double(fromMetal: $0.toMetal()) })
+        for (value, back) in zip(values, result) {
+            #expect(abs(back - value) <= abs(value) * 1e-14)
+        }
+    }
+
+    @Test func complexDoubleResult() async throws {
+        let values = [Complex<Double>(.pi, -2.718281828459045), Complex<Double>(0.1, 0.2)]
+        let result: [Complex<Double>] = try await metal.kernel("copy_float4_array").run(values, count: values.count)
+        for (value, back) in zip(values, result) {
+            #expect(abs(back.real - value.real) <= abs(value.real) * 1e-14)
+            #expect(abs(back.imaginary - value.imaginary) <= abs(value.imaginary) * 1e-14)
+        }
+    }
+
+    @Test func initialValueIsConverted() async throws {
+        let result = try await metal.kernel("keep_initial").run(count: 4, returning: ConvertibleCounter.self,
+                                                                initialValue: ConvertibleCounter(99))
+        #expect(result == [ConvertibleCounter(0), ConvertibleCounter(99), ConvertibleCounter(2), ConvertibleCounter(99)])
+    }
+
+    @Test func decodableWithoutInitialValue() async throws {
+        let result: [Counter] = try await metal.kernel("keep_initial").run(count: 4)
+        #expect(result.map(\.value) == [0, 0, 2, 0])
+    }
+
+    @Test func reusableBufferDecoding() async throws {
+        let transforms = [Transform(scale: 2, offset: 3, steps: 4)]
+        let output = try metal.makeBuffer(count: 1, of: TransformMtl.self)
+        try await metal.kernel("copy_transforms").run(transforms, count: 1, into: output)
+        #expect(output.decoded(as: Transform.self) == transforms)
+
+        let input = try metal.makeBuffer(count: 1, of: TransformMtl.self)
+        input.encode([Transform(scale: 5, offset: 6, steps: 7)])
+        try await metal.kernel("copy_transforms").run(input, count: 1, into: output)
+        #expect(output.decoded(as: Transform.self) == [Transform(scale: 5, offset: 6, steps: 7)])
+    }
+
+    // MARK: - Argument validation
+
+    @Test func wrongArgumentSizeIsDetected() async throws {
+        // Kernel expects Parameters (12 bytes) at index 1, a Float has 4 bytes
+        await #expect(throws: MetalComputeError.self) {
+            let _: [Float] = try await metal.kernel("scale_offset").run([Float(1)], Float(2), Int32(3), count: 1)
+        }
+    }
+
+    @Test func doubleLiteralForFloatIsDetected() async throws {
+        // 1.5 is a Double and passed as float2 (8 bytes), the kernel expects float (4 bytes)
+        let kernel = try metal.kernel("scale_offset")
+        do {
+            let _: [Float] = try await kernel.run([Float(1)], Parameters(scale: 1, offset: 0, iterations: 0), 1.5, count: 1)
+            Issue.record("Size mismatch not detected")
+        }
+        catch MetalComputeError.layoutMismatch(_, let index, let isOutput, let swiftSize, let metalSize) {
+            #expect(index == 2 && !isOutput && swiftSize == 8 && metalSize == 4)
+        }
+    }
+
+    @Test func wrongOutputTypeIsDetected() async throws {
+        // Kernel writes float (4 bytes), Double output has a float2 layout (8 bytes)
+        await #expect(throws: MetalComputeError.self) {
+            let _: [Double] = try await metal.kernel("add_arrays").run([Float(1)], [Float(2)], count: 1)
+        }
+    }
+
+    @Test func missingArgumentIsDetected() async throws {
+        await #expect(throws: MetalComputeError.self) {
+            let _: [Float] = try await metal.kernel("add_arrays").run([Float(1)], count: 1)
+        }
+    }
+
+    @Test func tooManyArgumentsAreDetected() async throws {
+        await #expect(throws: MetalComputeError.self) {
+            let _: [Float] = try await metal.kernel("add_arrays").run([Float(1)], [Float(2)], [Float(3)], count: 1)
+        }
+    }
+
+    @Test func kernelReportsBufferSizes() throws {
+        let sizes = try metal.kernel("scale_offset").bufferSizes
+        #expect(sizes == [0: 4, 1: 12, 2: 4, 3: 4])
+    }
+
+    @Test func validationCanBeDisabled() async throws {
+        let unchecked = try MetalCompute(source: kernelSource, validatesArguments: false)
+        #expect(try unchecked.kernel("add_arrays").bufferSizes == nil)
+        let result: [Float] = try await unchecked.kernel("add_arrays").run([Float(1)], [Float(2)], count: 1)
+        #expect(result == [3])
     }
 }
