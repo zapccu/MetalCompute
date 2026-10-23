@@ -218,53 +218,7 @@ Don't modify a buffer while a kernel using it is running.
 
 [Metal64](https://github.com/zapccu/Metal64) provides 64 bit floating point emulation for Metal.
 Its `Complex2` type (`SIMD4<Float>`, Metal `float4` / `c64`) can be passed directly.
-
-```swift
-import Metal64
-import MetalCompute
-
-extension ComputeParameters: MetalArgument {}
-
-enum MandelbrotGPU {
-    static let metal = try? MetalCompute()
-
-    nonisolated static func calculateMetal(P: DynamicParameters<PT>) async -> CombinedResult {
-        let cplx2Grid: LinearBuffer<Complex2> = P.dimensions.asDouble.mapScreenCoordinates(
-            resolution: P.resolution, osSize: P.osSize)
-
-        do {
-            guard let metal else { throw MetalComputeError.noDevice }
-
-            let result = try await metal.kernel("mandelbrot").run(
-                cplx2Grid.pointer, P.computeParameters, P.potential,
-                count: cplx2Grid.size,
-                initialValue: MandelbrotResult.initialValue.mandelbrotResultMtl)
-
-            return CombinedResult(
-                Matrix<MandelbrotResult>((P.osImageHeight, P.osImageWidth), grid: result.map { $0.mandelbrotResult }),
-                CalculationInfo(state: .completed)
-            )
-        }
-        catch {
-            return CombinedResult(nil, CalculationInfo(state: .error, message: "\(error)"))
-        }
-    }
-}
-```
-
-```metal
-#include "c64.h"
-
-kernel void mandelbrot(device const float4      *points    [[buffer(0)]],
-                       constant ComputeParameters &params  [[buffer(1)]],
-                       constant float             &potential [[buffer(2)]],
-                       device MandelbrotResultMtl *result  [[buffer(3)]],
-                       uint index [[thread_position_in_grid]])
-{
-    c64 c = c64(points[index]);
-    ...
-}
-```
+See folder Mandelbrot.
 
 ## Errors
 
