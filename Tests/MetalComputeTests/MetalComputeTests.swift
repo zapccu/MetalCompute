@@ -9,6 +9,7 @@
 
 import Testing
 import Metal
+import ComplexModule
 @testable import MetalCompute
 
 // Must match the Metal struct layout below
@@ -84,6 +85,35 @@ kernel void sum_large(constant float *large [[buffer(0)]],
     float sum = 0.0;
     for (int i = 0; i < 1280; i++) sum += large[i];
     result[index] = sum;
+}
+
+// Copy kernels for the f64 / c64 conversion tests
+kernel void copy_float2_value(constant float2 &value  [[buffer(0)]],
+                              device float2   *result [[buffer(1)]],
+                              uint index [[thread_position_in_grid]])
+{
+    result[index] = value;
+}
+
+kernel void copy_float2_array(device const float2 *values [[buffer(0)]],
+                              device float2       *result [[buffer(1)]],
+                              uint index [[thread_position_in_grid]])
+{
+    result[index] = values[index];
+}
+
+kernel void copy_float4_value(constant float4 &value  [[buffer(0)]],
+                              device float4   *result [[buffer(1)]],
+                              uint index [[thread_position_in_grid]])
+{
+    result[index] = value;
+}
+
+kernel void copy_float4_array(device const float4 *values [[buffer(0)]],
+                              device float4       *result [[buffer(1)]],
+                              uint index [[thread_position_in_grid]])
+{
+    result[index] = values[index];
 }
 
 // Mandelbrot iteration with escape radius 2, points as float2 (re, im)
@@ -207,5 +237,68 @@ struct MetalComputeTests {
             try await metal.kernel("add_arrays").run([Float](repeating: 1, count: 4), [Float](repeating: 1, count: 4),
                                                      count: 4, into: output)
         }
+    }
+
+    // MARK: - Double and Complex<Double>
+
+    static let doubles: [Double] = [.pi, -1.0 / 3.0, 1e30, -2.5e-30, 0, 123456789.123456789, .infinity]
+
+    /// hi + lo as Double
+    static func joined(_ f64: SIMD2<Float>) -> Double { Double(f64.x) + Double(f64.y) }
+
+    @Test func doubleValue() async throws {
+        let value = Double.pi
+        let result: [SIMD2<Float>] = try await metal.kernel("copy_float2_value").run(value, count: 1)
+        #expect(result == [f64Split(value)])
+        // ~48 bit precision, much better than Float
+        #expect(abs(Self.joined(result[0]) - value) < 1e-14)
+        #expect(result[0].y != 0)
+    }
+
+    @Test func doubleArray() async throws {
+        let result: [SIMD2<Float>] = try await metal.kernel("copy_float2_array").run(Self.doubles, count: Self.doubles.count)
+        #expect(result == Self.doubles.map(f64Split))
+        #expect(result.last == SIMD2<Float>(.infinity, 0))
+        for (value, f64) in zip(Self.doubles.dropLast(), result) {
+            #expect(abs(Self.joined(f64) - value) <= abs(value) * 1e-14)
+        }
+    }
+
+    @Test func doubleBufferPointer() throws {
+        let result: [SIMD2<Float>] = try Self.doubles.withUnsafeBufferPointer { pointer in
+            try metal.kernel("copy_float2_array").runAndWait(pointer, count: pointer.count)
+        }
+        #expect(result == Self.doubles.map(f64Split))
+    }
+
+    @Test func complexDoubleValue() async throws {
+        let value = Complex<Double>(1.0 / 3.0, -2.0 / 7.0)
+        let result: [SIMD4<Float>] = try await metal.kernel("copy_float4_value").run(value, count: 1)
+        let re = f64Split(value.real), im = f64Split(value.imaginary)
+        #expect(result == [SIMD4<Float>(re.x, re.y, im.x, im.y)])
+    }
+
+    @Test func complexDoubleArray() async throws {
+        let values = [Complex<Double>(.pi, -.pi), Complex<Double>(1e-20, 1e20), Complex<Double>(0, 1)]
+        let result: [SIMD4<Float>] = try await metal.kernel("copy_float4_array").run(values, count: values.count)
+        #expect(result == values.map(c64Split))
+        for (value, c64) in zip(values, result) {
+            #expect(abs(Self.joined(SIMD2(c64.x, c64.y)) - value.real) <= abs(value.real) * 1e-14)
+            #expect(abs(Self.joined(SIMD2(c64.z, c64.w)) - value.imaginary) <= abs(value.imaginary) * 1e-14)
+        }
+    }
+
+    @Test func complexFloatIsPassedUnchanged() async throws {
+        let value = Complex<Float>(1.5, -2.5)
+        let result: [SIMD2<Float>] = try await metal.kernel("copy_float2_value").run(value, count: 2)
+        #expect(result == [SIMD2<Float>(1.5, -2.5), SIMD2<Float>(1.5, -2.5)])
+    }
+
+    @Test func f64SplitSpecialValues() {
+        #expect(f64Split(.infinity) == SIMD2<Float>(.infinity, 0))
+        #expect(f64Split(-.infinity) == SIMD2<Float>(-.infinity, 0))
+        #expect(f64Split(1e300) == SIMD2<Float>(.infinity, 0))    // beyond Float range
+        #expect(f64Split(.nan).x.isNaN)
+        #expect(f64Split(1.0) == SIMD2<Float>(1, 0))
     }
 }

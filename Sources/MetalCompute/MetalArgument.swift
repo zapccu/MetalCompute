@@ -15,7 +15,9 @@ import Metal
 /// - Scalars: `Float`, `Int32`, `UInt32`, `Int16`, `UInt16`, `Int8`, `UInt8`, `Bool`
 ///   (and `Float16` on Apple silicon)
 /// - SIMD vectors: `SIMD2`, `SIMD3`, `SIMD4`, `SIMD8`, `SIMD16` (e.g. `SIMD2<Float>` = Metal `float2`)
-/// - Arrays and buffer pointers of plain values: `[T]`, `UnsafeBufferPointer<T>`, `UnsafeMutableBufferPointer<T>`
+/// - `Double` and `Complex<Double>`: converted to the 64 bit emulation format of Metal64,
+///   `float2` (hi, lo) and `float4` (re.hi, re.lo, im.hi, im.lo). `Complex<Float>` = Metal `float2`.
+/// - Arrays and buffer pointers of these types: `[T]`, `UnsafeBufferPointer<T>`, `UnsafeMutableBufferPointer<T>`
 /// - Persistent buffers: `MetalBuffer<T>`
 ///
 /// Own structs conform by an empty extension, as long as they only contain plain values
@@ -29,8 +31,8 @@ import Metal
 /// Single values are passed with `setBytes` (Metal `constant T&` or `constant T*`),
 /// arrays and buffer pointers are copied into a Metal buffer (Metal `device const T*`).
 ///
-/// `Int` and `Double` deliberately don't conform: Swift `Int` has 64 bit while Metal `int`
-/// has 32 bit, and Metal doesn't support `double`. Use `Int32` / `UInt32` and `Float`.
+/// `Int` deliberately doesn't conform: Swift `Int` has 64 bit while Metal `int` has 32 bit.
+/// Use `Int32` / `UInt32`, or `Int64` for Metal `long`.
 public protocol MetalArgument {
     /// Binds the argument to the compute encoder at the given buffer index.
     /// The default implementation passes the bytes of the value.
@@ -40,14 +42,18 @@ public protocol MetalArgument {
 /// Values up to this size are passed with setBytes, larger values in a buffer (Metal limit)
 let maxInlineBytes = 4096
 
-/// Precondition: the type must be a plain value type without references.
-/// Int, UInt and Double are rejected, they don't match Metal int / uint / float.
+/// Precondition: the type must be a plain value type without references, which is copied 1:1.
+/// Int and UInt are rejected, they don't match Metal int / uint.
+/// Double and Complex<Double> are rejected here: they can't be copied 1:1, because Metal doesn't
+/// support double. Arrays and buffer pointers of them are converted (see MetalArgument+F64.swift),
+/// buffers and output types must use SIMD2<Float> / SIMD4<Float> (Float2 / Complex2 of Metal64).
 @inline(__always)
 func requirePlainType<T>(_ type: T.Type) {
     precondition(_isPOD(type), "\(type) contains references (class, String, Array, ...) and cannot be passed to Metal")
     precondition(type != Int.self && type != UInt.self,
                  "Swift \(type) has 64 bit, use Int32 / UInt32 (Metal int / uint) or Int64 / UInt64 (Metal long / ulong)")
-    precondition(type != Double.self, "Metal doesn't support Double, use Float")
+    precondition(!isF64Type(type),
+                 "Metal doesn't support double, use SIMD2<Float> / SIMD4<Float> (Float2 / Complex2 of Metal64) for \(type) buffers and results")
 }
 
 /// Creates a shared Metal buffer containing a copy of the given bytes
@@ -104,14 +110,28 @@ extension SIMD16: MetalArgument {}
 
 // MARK: - Arrays and buffer pointers
 
+/// Copies the elements into a Metal buffer and binds it.
+/// Double and Complex<Double> elements are converted to the f64 / c64 format.
+func bindElements<E>(_ elements: UnsafeBufferPointer<E>, to encoder: any MTLComputeCommandEncoder,
+                     index: Int, device: any MTLDevice) throws {
+    guard !elements.isEmpty else { throw MetalComputeError.emptyArgument(index: index) }
+
+    let buffer: any MTLBuffer
+    if let converted = convertF64Elements(elements) {
+        buffer = try converted.withUnsafeBytes { try makeBuffer($0, device: device) }
+    }
+    else {
+        requirePlainType(E.self)
+        buffer = try makeBuffer(UnsafeRawBufferPointer(elements), device: device)
+    }
+    encoder.setBuffer(buffer, offset: 0, index: index)
+}
+
 extension Array: MetalArgument {
 
     /// Copies the array into a Metal buffer
     public func bind(to encoder: any MTLComputeCommandEncoder, index: Int, device: any MTLDevice) throws {
-        requirePlainType(Element.self)
-        guard !isEmpty else { throw MetalComputeError.emptyArgument(index: index) }
-        let buffer = try withUnsafeBytes { try makeBuffer($0, device: device) }
-        encoder.setBuffer(buffer, offset: 0, index: index)
+        try withUnsafeBufferPointer { try bindElements($0, to: encoder, index: index, device: device) }
     }
 }
 
@@ -119,10 +139,7 @@ extension UnsafeBufferPointer: MetalArgument {
 
     /// Copies the memory into a Metal buffer
     public func bind(to encoder: any MTLComputeCommandEncoder, index: Int, device: any MTLDevice) throws {
-        requirePlainType(Element.self)
-        guard !isEmpty else { throw MetalComputeError.emptyArgument(index: index) }
-        let buffer = try makeBuffer(UnsafeRawBufferPointer(self), device: device)
-        encoder.setBuffer(buffer, offset: 0, index: index)
+        try bindElements(self, to: encoder, index: index, device: device)
     }
 }
 
