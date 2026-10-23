@@ -31,6 +31,9 @@ public final class MetalCompute: @unchecked Sendable {
     /// Library containing the kernel functions
     public let library: any MTLLibrary
 
+    /// Check every kernel run against the kernel signature (number of buffers and sizes)
+    public let validatesArguments: Bool
+
     // Cache of created kernels (pipeline creation is expensive)
     private var kernels: [String: ComputeKernel] = [:]
     private let lock = NSLock()
@@ -39,7 +42,8 @@ public final class MetalCompute: @unchecked Sendable {
     /// - Parameters:
     ///   - library: Metal library containing the kernel functions
     ///   - device: Metal device, default is the system default device
-    public init(library: any MTLLibrary, device: (any MTLDevice)? = nil) throws {
+    ///   - validatesArguments: Check every kernel run against the kernel signature, default: true
+    public init(library: any MTLLibrary, device: (any MTLDevice)? = nil, validatesArguments: Bool = true) throws {
         guard let device = device ?? MTLCreateSystemDefaultDevice() else {
             throw MetalComputeError.noDevice
         }
@@ -49,6 +53,7 @@ public final class MetalCompute: @unchecked Sendable {
         self.device = device
         self.commandQueue = commandQueue
         self.library = library
+        self.validatesArguments = validatesArguments
     }
 
     /// Creates a MetalCompute object with the default Metal library of a bundle.
@@ -56,7 +61,9 @@ public final class MetalCompute: @unchecked Sendable {
     /// - Parameters:
     ///   - bundle: Bundle containing the compiled Metal library, default is the main (app) bundle
     ///   - device: Metal device, default is the system default device
-    public convenience init(bundle: Bundle = .main, device: (any MTLDevice)? = nil) throws {
+    ///   - validatesArguments: Check every kernel run against the kernel signature, default: true
+    public convenience init(bundle: Bundle = .main, device: (any MTLDevice)? = nil,
+                            validatesArguments: Bool = true) throws {
         guard let device = device ?? MTLCreateSystemDefaultDevice() else {
             throw MetalComputeError.noDevice
         }
@@ -67,7 +74,7 @@ public final class MetalCompute: @unchecked Sendable {
         catch {
             throw MetalComputeError.libraryNotAvailable(underlying: error)
         }
-        try self.init(library: library, device: device)
+        try self.init(library: library, device: device, validatesArguments: validatesArguments)
     }
 
     /// Creates a MetalCompute object by compiling Metal source code at runtime.
@@ -76,7 +83,9 @@ public final class MetalCompute: @unchecked Sendable {
     ///   - source: Metal source code with the kernel functions
     ///   - options: Compile options, default: safe math mode
     ///   - device: Metal device, default is the system default device
-    public convenience init(source: String, options: MTLCompileOptions? = nil, device: (any MTLDevice)? = nil) throws {
+    ///   - validatesArguments: Check every kernel run against the kernel signature, default: true
+    public convenience init(source: String, options: MTLCompileOptions? = nil, device: (any MTLDevice)? = nil,
+                            validatesArguments: Bool = true) throws {
         guard let device = device ?? MTLCreateSystemDefaultDevice() else {
             throw MetalComputeError.noDevice
         }
@@ -87,7 +96,7 @@ public final class MetalCompute: @unchecked Sendable {
         catch {
             throw MetalComputeError.libraryNotAvailable(underlying: error)
         }
-        try self.init(library: library, device: device)
+        try self.init(library: library, device: device, validatesArguments: validatesArguments)
     }
 
     /// Compile options with IEEE conform floating point math
@@ -116,13 +125,30 @@ public final class MetalCompute: @unchecked Sendable {
             throw MetalComputeError.functionNotFound(name)
         }
         let pipeline: any MTLComputePipelineState
+        var reflection: MTLComputePipelineReflection?
         do {
-            pipeline = try device.makeComputePipelineState(function: function)
+            pipeline = try device.makeComputePipelineState(function: function,
+                                                           options: validatesArguments ? .bindingInfo : [],
+                                                           reflection: &reflection)
         }
         catch {
             throw MetalComputeError.pipelineCreationFailed(name, underlying: error)
         }
-        let kernel = ComputeKernel(name: name, pipeline: pipeline, device: device, commandQueue: commandQueue)
+
+        // Buffer arguments of the kernel: index -> size of the value / one element in bytes
+        var bufferSizes: [Int: Int]? = nil
+        if validatesArguments, let reflection {
+            var sizes: [Int: Int] = [:]
+            for binding in reflection.bindings where binding.type == .buffer {
+                if let bufferBinding = binding as? any MTLBufferBinding {
+                    sizes[bufferBinding.index] = bufferBinding.bufferDataSize
+                }
+            }
+            bufferSizes = sizes
+        }
+
+        let kernel = ComputeKernel(name: name, pipeline: pipeline, device: device,
+                                   commandQueue: commandQueue, bufferSizes: bufferSizes)
         kernels[name] = kernel
         return kernel
     }

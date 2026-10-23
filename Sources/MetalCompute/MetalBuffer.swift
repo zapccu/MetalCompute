@@ -77,8 +77,28 @@ public struct MetalBuffer<Element>: MetalArgument, @unchecked Sendable {
         pointer.update(repeating: value)
     }
 
+    /// Converts the buffer content into an array of a MetalDecodable type whose
+    /// MetalLayout is the element type of this buffer
+    public func decoded<T: MetalDecodable>(as type: T.Type = T.self) -> [T] where T.MetalLayout == Element {
+        pointer.map { T(fromMetal: $0) }
+    }
+
+    /// Converts the values of a MetalEncodable array into the buffer (array.count must be <= count)
+    public func encode<T: MetalEncodable>(_ array: [T]) where T.MetalLayout == Element {
+        precondition(array.count <= count, "Array has more elements than the buffer")
+        let target = pointer
+        for (index, value) in array.enumerated() {
+            target[index] = value.toMetal()
+        }
+    }
+
     /// Binds the buffer to the compute encoder (no copy)
     public func bind(to encoder: any MTLComputeCommandEncoder, index: Int, device: any MTLDevice) throws {
         encoder.setBuffer(buffer, offset: 0, index: index)
+    }
+
+    /// Size of one element
+    public var metalStride: Int {
+        MemoryLayout<Element>.stride
     }
 }

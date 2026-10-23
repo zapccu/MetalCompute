@@ -22,6 +22,7 @@ let package = Package(
         .target(
             name: "MetalCompute",
             dependencies: [
+                .product(name: "RealModule", package: "swift-numerics"),
                 .product(name: "ComplexModule", package: "swift-numerics")
             ]
         ),

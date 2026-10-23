@@ -28,6 +28,11 @@ public enum MetalComputeError: Error, CustomStringConvertible {
     case outputBufferTooSmall(required: Int, available: Int)
     /// The GPU reported an error while executing the kernel
     case executionFailed(underlying: any Error)
+    /// The number of arguments doesn't match the buffer arguments of the kernel function.
+    /// `kernelBuffers` are the buffer indices of the kernel (inputs and output).
+    case argumentCountMismatch(kernel: String, kernelBuffers: [Int], given: Int)
+    /// The size of an argument (or one element of it) doesn't match the kernel function
+    case layoutMismatch(kernel: String, index: Int, isOutput: Bool, swiftSize: Int, metalSize: Int)
 
     public var description: String {
         switch self {
@@ -53,6 +58,14 @@ public enum MetalComputeError: Error, CustomStringConvertible {
             return "Output buffer too small: \(required) elements required, \(available) available"
         case .executionFailed(let error):
             return "Kernel execution failed: \(error)"
+        case .argumentCountMismatch(let kernel, let kernelBuffers, let given):
+            return "Kernel '\(kernel)' has buffer arguments \(kernelBuffers) (inputs + output), "
+                + "but \(given) arguments + output were passed (buffer 0...\(given))"
+        case .layoutMismatch(let kernel, let index, let isOutput, let swiftSize, let metalSize):
+            let what = isOutput ? "output buffer" : "argument"
+            return "Kernel '\(kernel)', \(what) at buffer index \(index): Swift type has \(swiftSize) bytes, "
+                + "Metal expects \(metalSize) bytes. Check the struct layout (Int vs Int32, Double vs Float2, padding) "
+                + "and the order of the arguments"
         }
     }
 }
