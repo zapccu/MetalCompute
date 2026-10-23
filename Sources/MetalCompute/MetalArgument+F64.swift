@@ -91,11 +91,10 @@ extension Float: MetalComplexScalar {
 // A conditional conformance doesn't imply the inherited protocols, so all are declared.
 // The members are implemented explicitly instead of relying on the protocol defaults.
 
-extension Complex: MetalLayoutProviding where RealType: MetalComplexScalar {
-    public typealias MetalLayout = RealType.ComplexMetalLayout
-}
-
 extension Complex: MetalArgument where RealType: MetalComplexScalar {
+
+    /// Metal layout, used by MetalEncodable and MetalDecodable
+    public typealias MetalLayout = RealType.ComplexMetalLayout
 
     /// Passes the value in Metal layout
     public func bind(to encoder: any MTLComputeCommandEncoder, index: Int, device: any MTLDevice) throws {

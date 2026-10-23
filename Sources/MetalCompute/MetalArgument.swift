@@ -132,7 +132,7 @@ extension SIMD16: MetalArgument {}
 /// Size of one element in Metal: the MetalLayout stride for MetalEncodable types, otherwise the stride
 func elementMetalStride<E>(_ type: E.Type) -> Int {
     if let encodable = type as? any MetalEncodable.Type {
-        return encodable.metalLayoutStride
+        return encodable.encodedStride
     }
     return MemoryLayout<E>.stride
 }

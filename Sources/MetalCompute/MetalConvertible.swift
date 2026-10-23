@@ -8,28 +8,6 @@
 
 import Metal
 
-/// Common base of MetalEncodable and MetalDecodable: a Swift type with an associated
-/// Metal layout type. Don't conform to it directly.
-public protocol MetalLayoutProviding {
-    /// Plain struct (numbers, SIMD vectors) with the layout of the Metal struct
-    associatedtype MetalLayout
-
-    /// Stride of MetalLayout. Has a default implementation.
-    static var metalLayoutStride: Int { get }
-}
-
-extension MetalLayoutProviding {
-
-    public static var metalLayoutStride: Int {
-        MemoryLayout<MetalLayout>.stride
-    }
-
-    /// Stops with a precondition failure if MetalLayout can't be copied 1:1 to Metal
-    static func checkMetalLayout() {
-        requirePlainType(MetalLayout.self)
-    }
-}
-
 /// A Swift type which is converted into a Metal layout type before it is passed to a kernel.
 ///
 /// Use it for structs whose Swift layout differs from the Metal struct, e.g. because they
@@ -55,9 +33,19 @@ extension MetalLayoutProviding {
 ///
 /// Single values, arrays and buffer pointers of the type are converted automatically.
 /// `MetalLayout` must be a plain struct (numbers, SIMD vectors) with the Metal layout.
-public protocol MetalEncodable: MetalArgument, MetalLayoutProviding {
+public protocol MetalEncodable: MetalArgument {
+    // MetalLayout is declared in both protocols (not in a common base protocol), because Swift
+    // infers an associated type only from requirements of the protocol declaring it.
+    // For a type conforming to both protocols, the same MetalLayout satisfies both.
+
+    /// Plain struct (numbers, SIMD vectors) with the layout of the Metal struct
+    associatedtype MetalLayout
+
     /// Converts the value into its Metal layout
     func toMetal() -> MetalLayout
+
+    /// Stride of MetalLayout. Has a default implementation.
+    static var encodedStride: Int { get }
 
     /// Converts `count` values at `elements` (memory bound to Self) and copies them into a new
     /// Metal buffer. Has a default implementation, used for arrays and buffer pointers.
@@ -87,9 +75,17 @@ public protocol MetalEncodable: MetalArgument, MetalLayoutProviding {
 ///
 /// let result: [Result] = try await kernel.run(points, parameters, count: points.count)
 /// ```
-public protocol MetalDecodable: MetalLayoutProviding {
+public protocol MetalDecodable {
+    /// Plain struct (numbers, SIMD vectors) with the layout of the Metal struct
+    associatedtype MetalLayout
+
     /// Creates the value from its Metal layout
     init(fromMetal value: MetalLayout)
+
+    /// Stride of MetalLayout. Has a default implementation.
+    // Named differently from MetalEncodable.encodedStride: two default implementations with the
+    // same name would be ambiguous for types conforming to both protocols.
+    static var decodedStride: Int { get }
 
     /// Converts `count` values at `source` (memory with MetalLayout) and initializes
     /// `destination` (uninitialized memory for Self). Has a default implementation.
@@ -113,6 +109,10 @@ extension MetalEncodable {
         MemoryLayout<MetalLayout>.stride
     }
 
+    public static var encodedStride: Int {
+        MemoryLayout<MetalLayout>.stride
+    }
+
     public static func makeMetalBuffer(from elements: UnsafeRawPointer, count: Int,
                                        device: any MTLDevice) throws -> any MTLBuffer {
         requirePlainType(MetalLayout.self)
@@ -128,6 +128,15 @@ extension MetalEncodable {
 }
 
 extension MetalDecodable {
+
+    public static var decodedStride: Int {
+        MemoryLayout<MetalLayout>.stride
+    }
+
+    /// Stops with a precondition failure if MetalLayout can't be copied 1:1 from Metal
+    static func checkDecodedLayout() {
+        requirePlainType(MetalLayout.self)
+    }
 
     public static func decodeMetal(from source: UnsafeRawPointer, into destination: UnsafeMutableRawPointer, count: Int) {
         let values = source.bindMemory(to: MetalLayout.self, capacity: count)
@@ -157,8 +166,8 @@ struct OutputBuffer<Output> {
 
         decodable = Output.self as? any MetalDecodable.Type
         if let decodable {
-            decodable.checkMetalLayout()
-            metalStride = decodable.metalLayoutStride
+            decodable.checkDecodedLayout()
+            metalStride = decodable.decodedStride
         }
         else {
             requirePlainType(Output.self)
